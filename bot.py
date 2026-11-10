@@ -1,7 +1,7 @@
 """
 Бот для Discord: пингует выбранную роль, когда выходит обновление Dota 2 или CS2.
 
-Установка:  pip install discord.py
+Установка:  pip install discord.py aiohttp deep-translator
 Запуск:     set DISCORD_TOKEN=твой_токен   (Windows)
             export DISCORD_TOKEN=твой_токен (Linux/macOS)
             python game_update_bot.py
@@ -30,11 +30,7 @@ CHECK_INTERVAL_MIN = 10
 STATE_FILE = Path("state.json")
 STEAM_API = "https://api.steampowered.com/ISteamNews/GetNewsForApp/v2/"
 
-# Необязательно: ключ API Anthropic для краткого пересказа на русском.
-# Без него бот просто переводит начало новости (нужен: pip install deep-translator).
-ANTHROPIC_KEY = os.environ.get("ANTHROPIC_API_KEY")
-ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-haiku-5-5")
-
+# Автоматический переводчик на русский язык
 try:
     from deep_translator import GoogleTranslator
 except ImportError:
@@ -105,12 +101,28 @@ class State:
         return self.data["guilds"].get(str(guild_id), {})
 
 
-# ------------------------------------------------------------------- Steam
+# ------------------------------------------------------------------- Steam и Перевод
+def translate_text(text: str) -> str:
+    """Безопасный перевод текста на русский язык."""
+    if not GoogleTranslator or not text.strip():
+        return text
+    try:
+        # Переводим текст с автоматическим определением исходного языка на русский
+        translated = GoogleTranslator(source='auto', target='ru').translate(text)
+        return translated if translated else text
+    except Exception as e:
+        print(f"Ошибка перевода: {e}")
+        return text
+
+
 def clean(text: str, limit: int = 500) -> str:
     text = re.sub(r"\[/?[^\]]+\]", "", text)  # BBCode
     text = re.sub(r"\{STEAM_CLAN_IMAGE\}\S*", "", text)
     text = re.sub(r"\n{3,}", "\n\n", text).strip()
-    return text[:limit] + ("…" if len(text) > limit else "")
+    cleaned = text[:limit] + ("…" if len(text) > limit else "")
+    
+    # Переводим очищенный текст описания на русский
+    return translate_text(cleaned)
 
 
 def is_update(game: str, item: dict) -> bool:
@@ -123,13 +135,18 @@ def is_update(game: str, item: dict) -> bool:
 
 def build_embed(game: str, item: dict) -> discord.Embed:
     info = GAMES[game]
+    
+    # Переводим заголовок патча на русский язык
+    original_title = item["title"]
+    translated_title = translate_text(original_title)
+    
     embed = discord.Embed(
-        title=item["title"][:256],
+        title=translated_title[:256],
         url=item["url"],
         description=clean(item.get("contents", "")),
         color=info["color"],
     )
-    embed.set_footer(text=f"{info['name']} • Steam News")
+    embed.set_footer(text=f"{info['name']} • Steam News (Русская версия)")
     embed.timestamp = datetime.fromtimestamp(item["date"], tz=timezone.utc)
     return embed
 
