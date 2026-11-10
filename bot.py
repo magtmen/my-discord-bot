@@ -1,3 +1,18 @@
+"""
+Бот для Discord: пингует выбранную роль, когда выходит обновление Dota 2 или CS2.
+
+Установка:  pip install discord.py
+Запуск:     set DISCORD_TOKEN=твой_токен   (Windows)
+            export DISCORD_TOKEN=твой_токен (Linux/macOS)
+            python game_update_bot.py
+
+Команды (только для тех, у кого есть право "Управлять сервером"):
+    /setup game channel role   - включить уведомления для игры
+    /disable game              - выключить уведомления для игры
+    /status                    - показать текущие настройки
+    /test game                 - отправить последнюю новость игры (проверка)
+"""
+
 import asyncio
 import json
 import os
@@ -15,14 +30,18 @@ CHECK_INTERVAL_MIN = 10
 STATE_FILE = Path("state.json")
 STEAM_API = "https://api.steampowered.com/ISteamNews/GetNewsForApp/v2/"
 
-# Подключаем переводчик
+# Необязательно: ключ API Anthropic для краткого пересказа на русском.
+# Без него бот просто переводит начало новости (нужен: pip install deep-translator).
+ANTHROPIC_KEY = os.environ.get("ANTHROPIC_API_KEY")
+ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-haiku-5-5")
+
 try:
     from deep_translator import GoogleTranslator
-    translator = GoogleTranslator(source='auto', target='ru')
-except Exception as e:
-    print(f"Не удалось инициализировать переводчик: {e}")
-    translator = None
+except ImportError:
+    GoogleTranslator = None
 
+# keywords: пост попадёт в канал, только если в заголовке есть одно из слов.
+# Пустой список = присылать все новости игры.
 GAMES = {
     "dota": {
         "name": "Dota 2",
@@ -43,6 +62,7 @@ GAME_CHOICES = [
 ]
 
 
+# ---------------------------------------------------------------- состояние
 class State:
     def __init__(self, path: Path):
         self.path = path
@@ -76,6 +96,7 @@ class State:
         return False
 
     def targets(self, game: str):
+        """Все (guild_id, channel_id, role_id), подписанные на игру."""
         for guild_id, games in self.data["guilds"].items():
             if game in games:
                 yield int(guild_id), games[game]["channel_id"], games[game]["role_id"]
@@ -84,24 +105,12 @@ class State:
         return self.data["guilds"].get(str(guild_id), {})
 
 
-def tr(text: str) -> str:
-    """Функция перевода текста"""
-    if not translator or not text.strip():
-        return text
-    try:
-        res = translator.translate(text)
-        return res if res else text
-    except Exception as e:
-        print(f"Ошибка перевода: {e}")
-        return text
-
-
+# ------------------------------------------------------------------- Steam
 def clean(text: str, limit: int = 500) -> str:
-    text = re.sub(r"\[/?[^\]]+\]", "", text)
+    text = re.sub(r"\[/?[^\]]+\]", "", text)  # BBCode
     text = re.sub(r"\{STEAM_CLAN_IMAGE\}\S*", "", text)
     text = re.sub(r"\n{3,}", "\n\n", text).strip()
-    cleaned = text[:limit] + ("…" if len(text) > limit else "")
-    return tr(cleaned)
+    return text[:limit] + ("…" if len(text) > limit else "")
 
 
 def is_update(game: str, item: dict) -> bool:
@@ -114,19 +123,18 @@ def is_update(game: str, item: dict) -> bool:
 
 def build_embed(game: str, item: dict) -> discord.Embed:
     info = GAMES[game]
-    title_ru = tr(item["title"])
-    
     embed = discord.Embed(
-        title=title_ru[:256],
+        title=item["title"][:256],
         url=item["url"],
         description=clean(item.get("contents", "")),
         color=info["color"],
     )
-    embed.set_footer(text=f"{info['name']} • Steam News (RU)")
+    embed.set_footer(text=f"{info['name']} • Steam News")
     embed.timestamp = datetime.fromtimestamp(item["date"], tz=timezone.utc)
     return embed
 
 
+# --------------------------------------------------------------------- бот
 class UpdateBot(discord.Client):
     def __init__(self):
         super().__init__(intents=discord.Intents.default())
@@ -157,7 +165,7 @@ class UpdateBot(discord.Client):
         ) as resp:
             resp.raise_for_status()
             data = await resp.json()
-        return data["appnews"]["newsitems"]
+        return data["appnews"]["newsitems"]  # новые -> старые
 
     async def send_update(self, game, item, channel_id, role_id) -> bool:
         channel = self.get_channel(channel_id)
@@ -188,7 +196,7 @@ class UpdateBot(discord.Client):
                 continue
 
             last_gid = self.state.get_last_gid(game)
-            if last_gid is None:
+            if last_gid is None:  # первый запуск - ничего не рассылаем
                 self.state.set_last_gid(game, items[0]["gid"])
                 print(f"[{game}] первый запуск, старые посты пропущены")
                 continue
@@ -199,7 +207,7 @@ class UpdateBot(discord.Client):
                     break
                 new_items.append(item)
 
-            for item in reversed(new_items):
+            for item in reversed(new_items):  # от старых к новым
                 if not is_update(game, item):
                     continue
                 for _, channel_id, role_id in list(self.state.targets(game)):
@@ -218,6 +226,7 @@ class UpdateBot(discord.Client):
 bot = UpdateBot()
 
 
+# ------------------------------------------------------------------ команды
 @bot.tree.command(name="setup", description="Включить уведомления об обновлениях игры")
 @app_commands.describe(
     game="Игра",
@@ -252,19 +261,34 @@ async def setup_cmd(
         return
 
     bot.state.set_target(interaction.guild_id, game.value, channel.id, role.id)
-    text = f"Готово. Обновления **{game.name}** будут приходить в {channel.mention} с пингом {role.mention}."
+
+    text = (
+        f"Готово. Обновления **{game.name}** будут приходить в {channel.mention} "
+        f"с пингом {role.mention}."
+    )
+    if not role.mentionable and not me.guild_permissions.mention_everyone:
+        text += (
+            "\n\nВнимание: роль не упоминаемая, и у бота нет права "
+            "«Упоминать всех». Включи упоминание для роли в её настройках "
+            "или выдай боту это право, иначе пинг не сработает."
+        )
     await interaction.response.send_message(
         text, allowed_mentions=discord.AllowedMentions.none()
     )
 
 
 @bot.tree.command(name="disable", description="Выключить уведомления об обновлениях игры")
+@app_commands.describe(game="Игра")
 @app_commands.choices(game=GAME_CHOICES)
 @app_commands.default_permissions(manage_guild=True)
 @app_commands.guild_only()
 async def disable_cmd(interaction: discord.Interaction, game: app_commands.Choice[str]):
     removed = bot.state.remove_target(interaction.guild_id, game.value)
-    msg = f"Уведомления для **{game.name}** выключены." if removed else f"Для **{game.name}** уведомления и не были включены."
+    msg = (
+        f"Уведомления для **{game.name}** выключены."
+        if removed
+        else f"Для **{game.name}** уведомления и не были включены."
+    )
     await interaction.response.send_message(msg, ephemeral=True)
 
 
@@ -277,7 +301,9 @@ async def status_cmd(interaction: discord.Interaction):
     for key, info in GAMES.items():
         if key in settings:
             s = settings[key]
-            lines.append(f"**{info['name']}**: <#{s['channel_id']}> → <@&{s['role_id']}>")
+            lines.append(
+                f"**{info['name']}**: <#{s['channel_id']}> → <@&{s['role_id']}>"
+            )
         else:
             lines.append(f"**{info['name']}**: выключено")
     await interaction.response.send_message(
@@ -287,14 +313,19 @@ async def status_cmd(interaction: discord.Interaction):
     )
 
 
-@bot.tree.command(name="test", description="Отправить последнюю новость игры (тест)")
+@bot.tree.command(
+    name="test", description="Отправить последнюю новость игры (с пингом роли)"
+)
+@app_commands.describe(game="Игра")
 @app_commands.choices(game=GAME_CHOICES)
 @app_commands.default_permissions(manage_guild=True)
 @app_commands.guild_only()
 async def test_cmd(interaction: discord.Interaction, game: app_commands.Choice[str]):
     target = bot.state.guild_settings(interaction.guild_id).get(game.value)
     if not target:
-        await interaction.response.send_message(f"Сначала настрой **{game.name}** через /setup.", ephemeral=True)
+        await interaction.response.send_message(
+            f"Сначала настрой **{game.name}** через /setup.", ephemeral=True
+        )
         return
 
     await interaction.response.defer(ephemeral=True)
@@ -311,13 +342,13 @@ async def test_cmd(interaction: discord.Interaction, game: app_commands.Choice[s
         game.value, items[0], target["channel_id"], target["role_id"]
     )
     await interaction.followup.send(
-        "Отправлено (проверьте канал)." if ok else "Не получилось отправить, проверь права бота."
+        "Отправлено." if ok else "Не получилось отправить, проверь права бота."
     )
 
 
 @bot.event
 async def on_ready():
-    print(f"Бот запущен как {bot.user}")
+    print(f"Бот запущен как {bot.user} (серверов: {len(bot.guilds)})")
 
 
 if __name__ == "__main__":
